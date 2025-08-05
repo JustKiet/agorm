@@ -1,0 +1,17 @@
+[project]
+name = "agorm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "faiss-cpu>=1.11.0.post1",
+    "langchain-community>=0.3.27",
+    "langchain-core>=0.3.72",
+    "langchain-voyageai>=0.1.6",
+    "openai>=1.0.0",
+    "openai-agents>=0.2.4",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "python-dotenv>=1.0.0",
+]
