@@ -2,24 +2,21 @@ from langchain_voyageai import VoyageAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_core.embeddings import Embeddings
-from openai import AsyncOpenAI
 import faiss  # type: ignore
 
-from agorm.core.io import MCPRouterBaseResponse, MCPRouterSSEResponse, MCPRouterStdioResponse
+from agorm.core.interfaces import IDissector
+from agorm.core.io import MCPRouterBaseResponse, MCPRouterSSEResponse, MCPRouterStdioResponse, FunctionToolDescription
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from typing import Any, Optional, Literal
-from pydantic import SecretStr, BaseModel
+from pydantic import SecretStr
 from contextlib import AsyncExitStack
 import asyncio
 import os
 import json
 import numpy as np
 import time
-
-class DissectedQueries(BaseModel):
-    queries: list[str]
 
 class NormalizedEmbeddings(Embeddings):
     """Wrapper to normalize embeddings for proper cosine similarity."""
@@ -53,8 +50,8 @@ class MCPRouter:
         server_url: str | None = None,
         voyageai_api_key: str | None = None,
         voyage_code_embedding_model: str = "voyage-code-3",
-        llm_client: AsyncOpenAI | None = None,
         transport: Literal["stdio", "sse"] = "sse",
+        dissector: IDissector | None = None,
     ):
         self._server_url = server_url
         if not voyageai_api_key:
@@ -85,14 +82,20 @@ class MCPRouter:
             index_to_docstore_id={}
         )
 
-        self.openai_client = llm_client or AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-        )
+        if dissector is None:
+            from agorm.clients.openai.dissector import OpenAIDissector
+            dissector = OpenAIDissector()
+        
+        self.dissector = dissector
+        self._total_schemas = 0
+        self.schemas: list[dict[str, Any]] = []
+        self.stdio_server_params: Optional[StdioServerParameters] = None
 
     @classmethod
     async def from_sse(
         cls, 
         server_url: str,
+        dissector: IDissector | None = None,
         voyageai_api_key: str | None = None,
         voyage_code_embedding_model: str = "voyage-3-large",
     ) -> "MCPRouter":
@@ -111,6 +114,7 @@ class MCPRouter:
                     voyageai_api_key=voyageai_api_key,
                     voyage_code_embedding_model=voyage_code_embedding_model,
                     transport="sse",
+                    dissector=dissector,
                 )
                 cls._total_schemas = len(cls.schemas)
                 await instance.store_schemas(cls.schemas)
@@ -121,6 +125,7 @@ class MCPRouter:
     async def from_stdio(
         cls,
         server_script_path: str,
+        dissector: IDissector | None = None,
         env: dict[str, str] | None = None,
         voyageai_api_key: str | None = None,
         voyage_code_embedding_model: str = "voyage-3-large",
@@ -165,6 +170,7 @@ class MCPRouter:
                     voyageai_api_key=voyageai_api_key,
                     voyage_code_embedding_model=voyage_code_embedding_model,
                     transport="stdio",
+                    dissector=dissector,
                 )
                 cls._total_schemas = len(cls.schemas)
                 await instance.store_schemas(cls.schemas)
@@ -221,58 +227,6 @@ class MCPRouter:
         print(f"Total time taken for tool retrieval: {time.time() - start_time:.2f} seconds")
 
         return tool_info
-        
-    async def dissect_query(
-        self,
-        query: str,
-    ) -> list[str]:
-        """
-        Dissect the query into actionable steps to identify relevant tools.
-
-        :param str query: The query to dissect.
-        :return: list of tool names that are relevant to the query.
-        :rtype: list[str]
-        """
-        start_time = time.time()
-        completion = await self.openai_client.chat.completions.parse(
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-                    You are an expert strategic planner. 
-                    Given a query, dissect it into subactions (actionable steps) that can be performed to complete the query.
-                    Each subaction should be a simple, single, actionable task that can be performed by a tool.
-                    For example, if the query is "I need to find a candidate in IT field and their expertise",
-                    the subactions could be:
-                    - "Get all available expertises (to get the IT expertise ID)"
-                    - "Search for candidates in IT field"
-                    - "Get expertise of candidates"
-                    """
-                },
-                {
-                    "role": "user",
-                    "content": f"""
-                    Dissect the following query into subqueries (actions) that can be performed by tools: {query}
-                    Here are all available tools and their descriptions for context:
-                    {json.dumps([{"name": tool["name"], "description": tool["description"]} for tool in self.schemas], indent=2)}
-                    """
-                }
-            ],
-            model="gpt-4.1-mini",
-            temperature=0.5,
-            response_format=DissectedQueries,
-        )
-
-        actionable_steps = completion.choices[0].message.parsed
-
-        if actionable_steps is None or not actionable_steps.queries:
-            print("No actionable steps found.")
-            return list(query)
-
-        print(f"Actionable steps: {actionable_steps.queries}")
-        print(f"Total time taken for query dissection: {time.time() - start_time:.2f} seconds")
-
-        return actionable_steps.queries
     
     async def route_tools(
         self,
@@ -286,7 +240,13 @@ class MCPRouter:
         :rtype: Optional[MCPServer]
         """
         start_time = time.time()
-        actionable_steps = await self.dissect_query(query)
+        actionable_steps = await self.dissector.dissect_query(
+            query=query,
+            tool_descriptions=[
+                FunctionToolDescription(function_name=tool["name"], description=tool["description"])
+                for tool in self.schemas
+            ]
+        )
         
         if not actionable_steps:
             print("No actionable steps to route.")
@@ -311,7 +271,7 @@ class MCPRouter:
                 actionable_steps=actionable_steps,
                 server_url=self._server_url,
             )
-        elif self._transport == "stdio":
+        elif self.stdio_server_params and self._transport == "stdio":
             return MCPRouterStdioResponse(
                 transport_type="stdio",
                 tool_names=required_tools,
@@ -320,3 +280,4 @@ class MCPRouter:
             )
         else:
             return None
+        

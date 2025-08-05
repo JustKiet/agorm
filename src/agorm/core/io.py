@@ -29,3 +29,10 @@ class MCPRouterStdioResponse(MCPRouterBaseResponse):
     transport_type: Literal["stdio"]
     stdio_params: StdioServerParameters
 
+class ActionableSteps(BaseModel):
+    steps: list[str]
+
+@dataclass
+class FunctionToolDescription:
+    function_name: str
+    description: str
